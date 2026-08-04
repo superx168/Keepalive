@@ -44,7 +44,8 @@ STEP_WAIT = 3000
 # 登录页 SPA 渐进渲染等待（ms）
 LOGIN_PAGE_WAIT = 6000
 # 等待登录表单（密码框）出现的最长时间（ms）
-LOGIN_FORM_WAIT_TIMEOUT = 15000
+# SPA 首屏渲染 + 内部接口请求可能较慢（尤其在无头/CI 环境），适当放宽
+LOGIN_FORM_WAIT_TIMEOUT = 40000
 
 
 # ---------------- 账号加载 ----------------
@@ -162,6 +163,18 @@ def dump_debug_state(page: Page, prefix: str) -> tuple:
         saved_png = png_path
     except Exception as e:
         logger.warning(f"保存调试截图失败: {e}")
+
+    # 额外打印 #app 容器当前的内容，用于判断 SPA 是"完全没渲染"
+    # 还是"渲染了但卡在 loading/错误状态"
+    try:
+        app_html = page.eval_on_selector("#app", "el => el.innerHTML") or ""
+        snippet = app_html.strip()
+        if snippet:
+            logger.info(f"#app 当前内容片段（前 300 字符）: {snippet[:300]}")
+        else:
+            logger.info("#app 容器仍为空 -> JS 尚未渲染任何内容")
+    except Exception as e:
+        logger.warning(f"读取 #app 内容失败: {e}")
 
     return saved_html, saved_png
 
@@ -450,6 +463,20 @@ def process_account(account: dict, playwright, headless: bool = True) -> dict:
 
         page.on("console", on_console)
         page.on("pageerror", lambda err: logger.warning(f"[pageerror] {err}"))
+
+        # 监听网络请求失败 / 非 2xx 响应，便于定位 SPA 卡住是否因接口请求失败导致
+        def on_request_failed(req):
+            logger.warning(f"[request_failed] {req.method} {req.url} -> {req.failure}")
+
+        def on_response(resp):
+            try:
+                if resp.status >= 400:
+                    logger.warning(f"[bad_response] {resp.status} {resp.url}")
+            except Exception:
+                pass
+
+        page.on("requestfailed", on_request_failed)
+        page.on("response", on_response)
 
         # 1. 登录
         if not do_login(page, email, password):
