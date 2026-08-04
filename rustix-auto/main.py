@@ -43,6 +43,8 @@ START_WAIT_TIMEOUT = 120
 STEP_WAIT = 3000
 # 登录页 SPA 渐进渲染等待（ms）
 LOGIN_PAGE_WAIT = 6000
+# 等待登录表单（密码框）出现的最长时间（ms）
+LOGIN_FORM_WAIT_TIMEOUT = 15000
 
 
 # ---------------- 账号加载 ----------------
@@ -139,6 +141,31 @@ def find_button_by_text(page: Page, texts):
     return None, None, None
 
 
+def dump_debug_state(page: Page, prefix: str) -> tuple:
+    """保存当前页面的 HTML 与整页截图，便于排查（如验证码/挑战页/渲染未完成等）。
+    返回 (html_path, png_path)，任一保存失败则对应值为 None。
+    """
+    ts = int(time.time())
+    html_path = f"{prefix}_{ts}.html"
+    png_path = f"{prefix}_{ts}.png"
+
+    saved_html, saved_png = None, None
+    try:
+        with open(html_path, "w", encoding="utf-8") as f:
+            f.write(page.content())
+        saved_html = html_path
+    except Exception as e:
+        logger.warning(f"保存调试 HTML 失败: {e}")
+
+    try:
+        page.screenshot(path=png_path, full_page=True)
+        saved_png = png_path
+    except Exception as e:
+        logger.warning(f"保存调试截图失败: {e}")
+
+    return saved_html, saved_png
+
+
 # ---------------- 登录流程 ----------------
 def do_login(page: Page, email: str, password: str) -> bool:
     logger.info(f"打开登录页: {LOGIN_URL}")
@@ -147,7 +174,27 @@ def do_login(page: Page, email: str, password: str) -> bool:
     except PWTimeout:
         logger.warning("页面加载超时，继续尝试")
 
-    page.wait_for_timeout(LOGIN_PAGE_WAIT)
+    # 不再使用固定 sleep 判断表单是否渲染完成，而是显式等待密码框出现。
+    # 这样能区分"表单确实没渲染出来"（可能是验证码/挑战页/加载慢）
+    # 和"表单渲染了但选择器不匹配"两种情况。
+    try:
+        page.wait_for_selector('input[type="password"]', timeout=LOGIN_FORM_WAIT_TIMEOUT, state="visible")
+    except PWTimeout:
+        html_path, png_path = dump_debug_state(page, "debug_login")
+        title = ""
+        try:
+            title = page.title()
+        except Exception:
+            pass
+        logger.error(
+            f"等待登录表单超时（{LOGIN_FORM_WAIT_TIMEOUT}ms 内未出现密码框）。"
+            f"当前 URL={page.url} 标题='{title}' "
+            f"已保存 HTML={html_path} 截图={png_path}"
+        )
+        return False
+
+    # 表单已出现，额外等待一小段时间让 SPA 完成渲染其余字段
+    page.wait_for_timeout(500)
 
     # 用户名/邮箱输入框（实测：type="text" name="username"）
     email_loc, email_sel = find_first_visible(page, [
@@ -164,8 +211,11 @@ def do_login(page: Page, email: str, password: str) -> bool:
     ])
 
     if not email_loc or not pwd_loc:
-        page.screenshot(path=f"debug_login_{int(time.time())}.png")
-        logger.error("未找到登录表单（邮箱/密码输入框）")
+        html_path, png_path = dump_debug_state(page, "debug_login")
+        logger.error(
+            f"未找到登录表单（邮箱/密码输入框）。"
+            f"已保存 HTML={html_path} 截图={png_path}"
+        )
         return False
 
     logger.info(f"填写账号: {email}")
