@@ -1,30 +1,35 @@
 #!/usr/bin/env python3
 """
-肖恩AI（free.supxh.xin）每日签到脚本（GitHub Actions 专用）
+API456 每日签到脚本（GitHub Actions 专用）
 使用 Cookie 认证，每次运行重新登录，支持多账号。
 
 需要的配置（环境变量）：
-  XIAOENAI_ACCOUNTS   多账号凭证，每行一个 `邮箱:密码`
-                      也支持逗号分隔或单行 `邮箱:密码`
-  TG_BOT_TOKEN        Telegram Bot Token（可选，为空则跳过通知）
-  TG_CHAT_ID          接收通知的 Chat ID（可选）
+  API456_ACCOUNTS    多账号凭证，每行一个 user:pass
+                       也支持逗号分隔或单行 user:pass
+  API456_BASE_URL    API456 站地址（可选，默认 https://api456.me）
+  TG_BOT_TOKEN       Telegram Bot Token（可选，为空则跳过通知）
+  TG_CHAT_ID         接收通知的 Chat ID（可选）
 """
 
 import os
 import re
 import sys
+import time
+import json
 import logging
 from datetime import datetime, timezone, timedelta
 import requests
 
 # ---------------------------------------------------------------------------
-# 日志（北京时间）
+# 配置
 # ---------------------------------------------------------------------------
-BASE_URL = os.getenv("XIAOENAI_BASE_URL") or "https://free.supxh.xin"
-ACCOUNTS_ENV = os.getenv("XIAOENAI_ACCOUNTS") or ""
+BASE_URL = os.getenv("API456_BASE_URL") or "https://api456.me"
+ACCOUNTS = os.getenv("API456_ACCOUNTS") or ""
 BJT = timezone(timedelta(hours=8))
 
-# 北京时间时区
+# ---------------------------------------------------------------------------
+# 日志（北京时间）
+# ---------------------------------------------------------------------------
 class BJTFormatter(logging.Formatter):
     """日志时间固定为北京时间（UTC+8）"""
     def converter(self, secs):
@@ -43,15 +48,14 @@ log.addHandler(_handler)
 # ---------------------------------------------------------------------------
 # 工具函数
 # ---------------------------------------------------------------------------
-
 def mask(name: str) -> str:
-    """用户名/邮箱脱敏：显示前 4 位 + *****"""
+    """用户名脱敏：显示前 4 位 + *****"""
     if not name:
         return "*****"
     return (name[:4] + "*****") if len(name) > 4 else (name + "*****")
 
 def bjt_date_str() -> str:
-    """北京时间日期字符串，如 '2026年08月02日'"""
+    """北京时间日期字符串，如 '2026年08月06日'"""
     now = datetime.now(BJT)
     return f"{now.year}年{now.month:02d}月{now.day:02d}日"
 
@@ -75,24 +79,25 @@ def parse_accounts(raw: str) -> list:
     return accounts
 
 def get_json(resp: requests.Response):
-    """解析 JSON；非 JSON 响应（如 Next.js 404 页面）返回 None"""
+    """解析 JSON；非 JSON 响应返回 None"""
     try:
         return resp.json()
-    except ValueError:
+    except (ValueError, json.JSONDecodeError):
         log.warning("响应非 JSON（HTTP %s），可能接口路径已变更", resp.status_code)
         return None
 
 # ---------------------------------------------------------------------------
 # 会话与 API
 # ---------------------------------------------------------------------------
-
 def create_session() -> requests.Session:
     """创建仿浏览器 Session"""
     s = requests.Session()
     s.headers.update({
-        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                       "AppleWebKit/537.36 (KHTML, like Gecko) "
-                       "Chrome/131.0.0.0 Safari/537.36"),
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
         "Accept": "application/json, text/plain, */*",
         "Content-Type": "application/json",
         "Referer": f"{BASE_URL}/login",
@@ -100,29 +105,41 @@ def create_session() -> requests.Session:
     })
     return s
 
-def do_login(session: requests.Session, username: str, password: str) -> bool:
-    """登录，成功后 auth_token Cookie 自动存入 session"""
+def do_login(session: requests.Session, username: str, password: str):
+    """
+    登录，成功后 access_token / Cookie 自动存入 session。
+    成功返回用户 dict（含 id，用于 New-Api-User 请求头）；失败返回 {}。
+    """
     payload = {"username": username, "password": password}
     try:
-        data = get_json(session.post(f"{BASE_URL}/api/auth/login", json=payload, timeout=25))
-        if not data:
-            return False
-        if data.get("success"):
+        data = get_json(session.post(f"{BASE_URL}/api/user/login", json=payload, timeout=25))
+        if data and data.get("success"):
             log.info("登录成功: %s", mask(username))
-            return True
-        log.error("登录失败: %s", data.get("message", "未知错误"))
-        return False
+            return data.get("data", {})
+        msg = data.get("message", "未知错误") if data else "响应为空"
+        # 常见错误友好提示
+        if "用户名或密码" in msg or "invalid" in msg.lower():
+            msg = "用户名或密码错误"
+        elif "未激活" in msg or "not activated" in msg.lower():
+            msg = "账号未激活"
+        log.error("登录失败: %s", msg)
+        return {}
     except requests.RequestException as e:
         log.error("登录请求异常: %s", e)
-        return False
+        return {}
 
-def do_signin(session: requests.Session) -> tuple:
+def do_checkin(session: requests.Session, user_id: str) -> tuple:
     """
-    执行签到，返回 (是否本次新签到, 状态描述)
-    接口在「今天已签到」时也返回 success:false，需按 message 区分。
+    执行签到，返回 (是否本次新签到, 状态描述)。
+    New-API 标准签到接口需要 New-Api-User 请求头。
     """
     try:
-        data = get_json(session.post(f"{BASE_URL}/api/user/signin", json={}, timeout=25))
+        headers = {"New-Api-User": str(user_id)}
+        data = get_json(
+            session.post(
+                f"{BASE_URL}/api/user/checkin", json={}, headers=headers, timeout=25
+            )
+        )
         if not data:
             return False, "签到接口异常"
 
@@ -139,10 +156,13 @@ def do_signin(session: requests.Session) -> tuple:
         log.error("签到请求异常: %s", e)
         return False, "签到请求异常"
 
-def get_user_info(session: requests.Session) -> dict:
-    """获取用户信息（含 quota / permanentQuota / dailyQuota / isVip）"""
+def get_user_info(session: requests.Session, user_id: str) -> dict:
+    """获取用户信息（含 quota 等余额字段）"""
     try:
-        data = get_json(session.get(f"{BASE_URL}/api/auth/me", timeout=25))
+        headers = {"New-Api-User": str(user_id)}
+        data = get_json(
+            session.get(f"{BASE_URL}/api/user/self", headers=headers, timeout=25)
+        )
         if data and data.get("success"):
             return data.get("data", {})
         if data:
@@ -154,7 +174,6 @@ def get_user_info(session: requests.Session) -> dict:
 # ---------------------------------------------------------------------------
 # 单账号流程
 # ---------------------------------------------------------------------------
-
 def process_account(username: str, password: str) -> dict:
     """
     处理单个账号的登录 + 签到 + 查额度
@@ -166,49 +185,45 @@ def process_account(username: str, password: str) -> dict:
         "new_signin": False,
         "status": "",
         "quota": 0,
-        "permanent_quota": 0,
-        "daily_quota": 0,
-        "is_vip": False,
+        "balance_coins": 0.0,
     }
 
     session = create_session()
 
-    if not do_login(session, username, password):
+    user = do_login(session, username, password)
+    if not user:
         result["status"] = "登录失败"
         return result
 
-    result["new_signin"], result["status"] = do_signin(session)
+    user_id = str(user.get("id", ""))
 
-    # 签到后查询最新额度
-    info = get_user_info(session)
-    if not info:
+    result["new_signin"], result["status"] = do_checkin(session, user_id)
+
+    # 查询最新余额
+    info = get_user_info(session, user_id)
+    if info:
+        result["success"] = True
+        result["username"] = mask(info.get("username") or username)
+        result["quota"] = info.get("quota", 0)
+        # api456.me 换算：1 硬币 = 50000 quota
+        result["balance_coins"] = round((result["quota"] or 0) / 50000, 2)
+        log.info("当前余额: %.2f 硬币（%d quota）", result["balance_coins"], result["quota"])
+    else:
         result["status"] += "（额度查询失败）"
-        return result
 
-    result["success"] = True
-    result["username"] = mask(info.get("username") or username)
-    result["quota"] = info.get("quota", 0)
-    result["permanent_quota"] = info.get("permanentQuota", 0)
-    result["daily_quota"] = info.get("dailyQuota", 0)
-    result["is_vip"] = bool(info.get("isVip"))
-    log.info("当前额度: %s（永久 %s + 每日 %s）",
-             f"{result['quota']:,}",
-             f"{result['permanent_quota']:,}",
-             f"{result['daily_quota']:,}")
     return result
 
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
-
 def main():
     log.info("=" * 48)
-    log.info("肖恩AI 每日签到脚本启动")
+    log.info("API456 每日签到脚本启动")
     log.info("目标站点: %s", BASE_URL)
 
-    accounts = parse_accounts(ACCOUNTS_ENV)
+    accounts = parse_accounts(ACCOUNTS)
     if not accounts:
-        log.error("未配置 XIAOENAI_ACCOUNTS（格式：每行 `邮箱:密码`），脚本退出")
+        log.error("未配置 API456_ACCOUNTS（格式：每行 `user:pass`），脚本退出")
         sys.exit(1)
 
     log.info("共 %d 个账号待签到", len(accounts))
@@ -227,8 +242,8 @@ def main():
         "results": results,
     }
     try:
-        from notify import send_tg_notification  # type: ignore
-        send_tg_notification(notify_data)
+        from notify import send_combined_notification  # type: ignore
+        send_combined_notification(notify_data)
     except ImportError as e:
         log.warning("无法导入 notify 模块: %s", e)
     except Exception as e:
